@@ -134,6 +134,8 @@ async def create_toml_file(request: Request):
         "machine_rank": config.pop("machine_rank", 0),
         "main_process_ip": config.pop("main_process_ip", ""),
         "main_process_port": config.pop("main_process_port", 29500),
+        "nccl_socket_ifname": config.pop("nccl_socket_ifname", ""),
+        "gloo_socket_ifname": config.pop("gloo_socket_ifname", ""),
     }
 
     suggest_cpu_threads = 8 if len(train_utils.get_total_images(config["train_data_dir"])) > 200 else 2

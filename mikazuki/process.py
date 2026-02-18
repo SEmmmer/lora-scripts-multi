@@ -34,28 +34,35 @@ def run_train(toml_path: str,
     machine_rank = int(distributed_config.get("machine_rank", 0) or 0)
     main_process_ip = distributed_config.get("main_process_ip")
     main_process_port = int(distributed_config.get("main_process_port", 29500) or 29500)
-    num_processes = distributed_config.get("num_processes")
-    if num_processes is None:
-        num_processes = len(gpu_ids) if gpu_ids else 1
+    nccl_socket_ifname = str(distributed_config.get("nccl_socket_ifname", "") or "").strip()
+    gloo_socket_ifname = str(distributed_config.get("gloo_socket_ifname", "") or "").strip()
+    num_processes_per_machine = distributed_config.get("num_processes")
+    if num_processes_per_machine is None:
+        num_processes_per_machine = len(gpu_ids) if gpu_ids else 1
     else:
-        num_processes = int(num_processes)
+        num_processes_per_machine = int(num_processes_per_machine)
+    total_num_processes = num_processes_per_machine * num_machines
 
     if num_machines < 1:
         return APIResponse(status="error", message="num_machines 必须 >= 1")
-    if num_processes < 1:
+    if num_processes_per_machine < 1:
         return APIResponse(status="error", message="num_processes 必须 >= 1")
     if num_machines > 1 and not main_process_ip:
         return APIResponse(status="error", message="多机训练时 main_process_ip 不能为空")
     if machine_rank < 0 or machine_rank >= num_machines:
         return APIResponse(status="error", message="machine_rank 超出范围，请检查 machine_rank 与 num_machines")
+    if nccl_socket_ifname:
+        customize_env["NCCL_SOCKET_IFNAME"] = nccl_socket_ifname
+    if gloo_socket_ifname:
+        customize_env["GLOO_SOCKET_IFNAME"] = gloo_socket_ifname
 
     if gpu_ids:
         customize_env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
         log.info(f"Using GPU(s) / 使用 GPU: {gpu_ids}")
 
     launch_args = []
-    if num_processes > 1 or num_machines > 1:
-        launch_args += ["--multi_gpu", "--num_processes", str(num_processes)]
+    if total_num_processes > 1 or num_machines > 1:
+        launch_args += ["--multi_gpu", "--num_processes", str(total_num_processes)]
         if num_machines > 1:
             launch_args += [
                 "--num_machines", str(num_machines),
@@ -67,7 +74,7 @@ def run_train(toml_path: str,
                 f"Distributed launch enabled / 启用跨机分布式: "
                 f"num_machines={num_machines}, machine_rank={machine_rank}, "
                 f"main_process_ip={main_process_ip}, main_process_port={main_process_port}, "
-                f"num_processes={num_processes}"
+                f"num_processes_per_machine={num_processes_per_machine}, total_num_processes={total_num_processes}"
             )
         if sys.platform == "win32":
             customize_env["USE_LIBUV"] = "0"

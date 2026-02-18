@@ -240,6 +240,8 @@
             machine_rank: Schema.number().min(0).default(0).description("当前机器编号。主机填 0，从机填 1"),
             main_process_ip: Schema.string().default("10.0.0.231").description("主机 IP（machine_rank=0 的机器 IP）"),
             main_process_port: Schema.number().min(1).max(65535).default(29500).description("主机端口，所有机器保持一致"),
+            nccl_socket_ifname: Schema.string().default("wg0").description("NCCL 通信网卡名，如 eth0 / eno1 / wg0"),
+            gloo_socket_ifname: Schema.string().default("wg0").description("GLOO 通信网卡名，如 eth0 / eno1 / wg0"),
         }).description("分布式训练"),
 
     }
