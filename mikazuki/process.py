@@ -791,30 +791,53 @@ def run_train(toml_path: str,
     customize_env["PYTHONWARNINGS"] = "ignore::FutureWarning,ignore::UserWarning"
 
     distributed_config = distributed_config or {}
+    sync_from_main_settings = distributed_config.get("sync_from_main_settings")
+    if not isinstance(sync_from_main_settings, dict):
+        sync_from_main_settings = {}
+
+    def get_sync_value(key, default):
+        value = distributed_config.get(key, None)
+        if value is not None:
+            return value
+        return sync_from_main_settings.get(key, default)
+
+    enable_distributed_training = _to_bool(distributed_config.get("enable_distributed_training"), False)
     num_machines = int(distributed_config.get("num_machines", 1) or 1)
     machine_rank = int(distributed_config.get("machine_rank", 0) or 0)
     main_process_ip = distributed_config.get("main_process_ip")
     main_process_port = int(distributed_config.get("main_process_port", 29500) or 29500)
     nccl_socket_ifname = str(distributed_config.get("nccl_socket_ifname", "") or "").strip()
     gloo_socket_ifname = str(distributed_config.get("gloo_socket_ifname", "") or "").strip()
-    sync_config_from_main = _to_bool(distributed_config.get("sync_config_from_main"), True)
-    sync_config_keys_from_main = _parse_sync_config_keys(distributed_config.get("sync_config_keys_from_main"))
-    sync_missing_assets_from_main = _to_bool(distributed_config.get("sync_missing_assets_from_main"), True)
-    sync_asset_keys = _parse_csv(distributed_config.get("sync_asset_keys"), DEFAULT_SYNC_ASSET_KEYS)
-    sync_main_repo_dir = str(distributed_config.get("sync_main_repo_dir", base_dir_path()) or base_dir_path())
-    sync_main_toml = str(distributed_config.get("sync_main_toml", "") or "").strip()
-    sync_ssh_user = str(distributed_config.get("sync_ssh_user", "") or "").strip()
-    sync_ssh_port = int(distributed_config.get("sync_ssh_port", 22) or 22)
-    sync_use_password_auth = _to_bool(distributed_config.get("sync_use_password_auth"), True)
+    sync_config_from_main = _to_bool(get_sync_value("sync_config_from_main", True), True)
+    sync_config_keys_from_main = _parse_sync_config_keys(get_sync_value("sync_config_keys_from_main", None))
+    sync_missing_assets_from_main = _to_bool(get_sync_value("sync_missing_assets_from_main", True), True)
+    sync_asset_keys = _parse_csv(get_sync_value("sync_asset_keys", None), DEFAULT_SYNC_ASSET_KEYS)
+    sync_main_repo_dir = str(get_sync_value("sync_main_repo_dir", base_dir_path()) or base_dir_path())
+    sync_main_toml = str(
+        get_sync_value("sync_main_toml", "./config/autosave/distributed-main-latest.toml")
+        or "./config/autosave/distributed-main-latest.toml"
+    ).strip()
+    sync_ssh_user = str(get_sync_value("sync_ssh_user", "") or "").strip()
+    sync_ssh_port = int(get_sync_value("sync_ssh_port", 22) or 22)
+    sync_use_password_auth = _to_bool(get_sync_value("sync_use_password_auth", True), True)
     clear_dataset_npz_before_train = _to_bool(distributed_config.get("clear_dataset_npz_before_train"), False)
     sync_ssh_password = str(
-        distributed_config.get("sync_ssh_password", "") or os.environ.get("MIKAZUKI_SYNC_SSH_PASSWORD", "")
+        get_sync_value("sync_ssh_password", "") or os.environ.get("MIKAZUKI_SYNC_SSH_PASSWORD", "")
     ).strip()
     num_processes_per_machine = distributed_config.get("num_processes")
     if num_processes_per_machine is None:
         num_processes_per_machine = len(gpu_ids) if gpu_ids else 1
     else:
         num_processes_per_machine = int(num_processes_per_machine)
+
+    # If distributed mode is disabled, always run as single machine.
+    if not enable_distributed_training:
+        num_machines = 1
+        machine_rank = 0
+        main_process_ip = ""
+        nccl_socket_ifname = ""
+        gloo_socket_ifname = ""
+
     total_num_processes = num_processes_per_machine * num_machines
 
     if num_machines < 1:
@@ -825,12 +848,13 @@ def run_train(toml_path: str,
         return APIResponse(status="error", message="多机训练时 main_process_ip 不能为空")
     if machine_rank < 0 or machine_rank >= num_machines:
         return APIResponse(status="error", message="machine_rank 超出范围，请检查 machine_rank 与 num_machines")
-    ok, message = _validate_socket_ifname(nccl_socket_ifname, "NCCL_SOCKET_IFNAME")
-    if not ok:
-        return APIResponse(status="error", message=message)
-    ok, message = _validate_socket_ifname(gloo_socket_ifname, "GLOO_SOCKET_IFNAME")
-    if not ok:
-        return APIResponse(status="error", message=message)
+    if num_machines > 1:
+        ok, message = _validate_socket_ifname(nccl_socket_ifname, "NCCL_SOCKET_IFNAME")
+        if not ok:
+            return APIResponse(status="error", message=message)
+        ok, message = _validate_socket_ifname(gloo_socket_ifname, "GLOO_SOCKET_IFNAME")
+        if not ok:
+            return APIResponse(status="error", message=message)
 
     if nccl_socket_ifname:
         customize_env["NCCL_SOCKET_IFNAME"] = nccl_socket_ifname
