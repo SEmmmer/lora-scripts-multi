@@ -17,11 +17,12 @@ from mikazuki.tasks import tm
 from mikazuki.launch_utils import base_dir_path
 
 
-DEFAULT_SYNC_CONFIG_KEYS = (
+LEGACY_DEFAULT_SYNC_CONFIG_KEYS = (
     "train_batch_size,gradient_accumulation_steps,max_train_epochs,"
     "learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,"
     "network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision"
 )
+DEFAULT_SYNC_CONFIG_KEYS = "*"
 DEFAULT_SYNC_ASSET_KEYS = "pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume"
 WORKER_OUTPUT_MARKER = "THIS_IS_WORKER_NODE_CHECK_MAIN_OUTPUTS"
 
@@ -46,6 +47,20 @@ def _to_int(value, default=0):
 def _parse_csv(value, default_csv: str):
     raw = str(value if value is not None else default_csv)
     return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def _parse_sync_config_keys(value):
+    keys = _parse_csv(value, DEFAULT_SYNC_CONFIG_KEYS)
+    lowered = {k.strip().lower() for k in keys}
+    if any(k in {"*", "__all__", "all"} for k in lowered):
+        return ["*"]
+
+    legacy = {x.strip().lower() for x in LEGACY_DEFAULT_SYNC_CONFIG_KEYS.split(",")}
+    if {k.strip().lower() for k in keys} == legacy:
+        log.info("[sync-config] detected legacy key list, auto-upgrade to full sync mode")
+        return ["*"]
+
+    return keys
 
 
 def _resolve_local_path(path_value: str, repo_root: Path) -> Path:
@@ -345,8 +360,13 @@ def _sync_config_from_main(
 
     log.info(f"[sync-config] use main toml: {used_toml_path}")
 
+    sync_all = any(str(k).strip().lower() in {"*", "__all__", "all"} for k in sync_keys)
+    keys_to_sync = list(main_config.keys()) if sync_all else sync_keys
+    if sync_all:
+        log.info(f"[sync-config] full sync mode enabled: syncing all {len(keys_to_sync)} top-level keys")
+
     changed = 0
-    for key in sync_keys:
+    for key in keys_to_sync:
         if key not in main_config:
             log.warning(f"[sync-config] key not found on main config: {key}")
             continue
@@ -532,7 +552,7 @@ def run_train(toml_path: str,
     nccl_socket_ifname = str(distributed_config.get("nccl_socket_ifname", "") or "").strip()
     gloo_socket_ifname = str(distributed_config.get("gloo_socket_ifname", "") or "").strip()
     sync_config_from_main = _to_bool(distributed_config.get("sync_config_from_main"), True)
-    sync_config_keys_from_main = _parse_csv(distributed_config.get("sync_config_keys_from_main"), DEFAULT_SYNC_CONFIG_KEYS)
+    sync_config_keys_from_main = _parse_sync_config_keys(distributed_config.get("sync_config_keys_from_main"))
     sync_missing_assets_from_main = _to_bool(distributed_config.get("sync_missing_assets_from_main"), True)
     sync_asset_keys = _parse_csv(distributed_config.get("sync_asset_keys"), DEFAULT_SYNC_ASSET_KEYS)
     sync_main_repo_dir = str(distributed_config.get("sync_main_repo_dir", base_dir_path()) or base_dir_path())

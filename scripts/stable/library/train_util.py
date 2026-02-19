@@ -652,6 +652,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         # caching
         self.caching_mode = None  # None, 'latents', 'text'
+        self._warned_missing_flipped_latents_npz = set()
 
     def adjust_min_max_bucket_reso_by_steps(
         self, resolution: Tuple[int, int], min_bucket_reso: int, max_bucket_reso: int, bucket_reso_steps: int
@@ -1270,9 +1271,22 @@ class BaseDataset(torch.utils.data.Dataset):
             elif image_info.latents_npz is not None:  # FineTuningDatasetまたはcache_latents_to_disk=Trueの場合
                 latents, original_size, crop_ltrb, flipped_latents, alpha_mask = load_latents_from_disk(image_info.latents_npz)
                 if flipped:
-                    latents = flipped_latents
+                    if flipped_latents is not None:
+                        latents = flipped_latents
+                    else:
+                        flipped_npz_path = getattr(image_info, "latents_npz_flipped", None)
+                        if flipped_npz_path is not None and os.path.exists(flipped_npz_path):
+                            latents, original_size, crop_ltrb, _, alpha_mask = load_latents_from_disk(flipped_npz_path)
+                        else:
+                            if image_info.latents_npz not in self._warned_missing_flipped_latents_npz:
+                                logger.warning(
+                                    f"missing flipped latents for {image_info.latents_npz}, fallback to non-flipped latents"
+                                )
+                                self._warned_missing_flipped_latents_npz.add(image_info.latents_npz)
                     alpha_mask = None if alpha_mask is None else alpha_mask[:, ::-1].copy()  # copy to avoid negative stride problem
                     del flipped_latents
+                if latents is None:
+                    raise ValueError(f"invalid cached latents data (None): {image_info.latents_npz}")
                 latents = torch.FloatTensor(latents)
                 if alpha_mask is not None:
                     alpha_mask = torch.FloatTensor(alpha_mask)
