@@ -127,9 +127,64 @@ class NetworkTrainer:
         return noise_pred
 
     def all_reduce_network(self, accelerator, network):
+        try:
+            bucket_mb = max(1, int(os.environ.get("MIKAZUKI_GRAD_ALLREDUCE_BUCKET_MB", "32")))
+        except Exception:
+            bucket_mb = 32
+        max_bucket_bytes = bucket_mb * 1024 * 1024
+
+        reduce_calls = 0
+        reduce_bytes = 0
+
+        grouped = {}
+        sparse_grads = []
         for param in network.parameters():
-            if param.grad is not None:
-                param.grad = accelerator.reduce(param.grad, reduction="mean")
+            grad = param.grad
+            if grad is None:
+                continue
+            if grad.is_sparse:
+                sparse_grads.append(grad)
+                continue
+            key = (grad.device, grad.dtype)
+            grouped.setdefault(key, []).append(grad)
+
+        # Sparse gradients are rare here; keep fallback behavior for correctness.
+        for grad in sparse_grads:
+            reduced = accelerator.reduce(grad, reduction="mean")
+            grad.copy_(reduced)
+            reduce_calls += 1
+            reduce_bytes += grad.numel() * grad.element_size()
+
+        def flush_bucket(bucket):
+            nonlocal reduce_calls, reduce_bytes
+            if not bucket:
+                return
+
+            flat = torch.cat([g.reshape(-1) for g in bucket], dim=0)
+            reduce_bytes += flat.numel() * flat.element_size()
+            reduced = accelerator.reduce(flat, reduction="mean")
+            reduce_calls += 1
+
+            offset = 0
+            for grad in bucket:
+                numel = grad.numel()
+                grad.copy_(reduced[offset : offset + numel].view_as(grad))
+                offset += numel
+
+        for _, grads in grouped.items():
+            bucket = []
+            bucket_bytes = 0
+            for grad in grads:
+                grad_bytes = grad.numel() * grad.element_size()
+                if bucket and bucket_bytes + grad_bytes > max_bucket_bytes:
+                    flush_bucket(bucket)
+                    bucket = []
+                    bucket_bytes = 0
+                bucket.append(grad)
+                bucket_bytes += grad_bytes
+            flush_bucket(bucket)
+
+        return reduce_calls, reduce_bytes
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
@@ -825,6 +880,8 @@ class NetworkTrainer:
             "step_total": 0.0,
             "data_wait": 0.0,
             "all_reduce": 0.0,
+            "all_reduce_calls": 0,
+            "all_reduce_bytes": 0,
             "optim": 0.0,
             "compute": 0.0,
         }
@@ -941,6 +998,8 @@ class NetworkTrainer:
 
                 all_reduce_time = 0.0
                 optim_time = 0.0
+                all_reduce_calls = 0
+                all_reduce_bytes = 0
                 with accelerator.accumulate(training_model):
                     on_step_start(text_encoder, unet)
 
@@ -1040,7 +1099,8 @@ class NetworkTrainer:
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
                         all_reduce_started_at = time.perf_counter()
-                        self.all_reduce_network(accelerator, network)  # sync DDP grad manually
+                        # network params are attached to U-Net/Text-Encoder, so we manually all-reduce grads.
+                        all_reduce_calls, all_reduce_bytes = self.all_reduce_network(accelerator, network)
                         all_reduce_time += time.perf_counter() - all_reduce_started_at
                         if args.max_grad_norm != 0.0:
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
@@ -1067,6 +1127,8 @@ class NetworkTrainer:
                     perf_window["step_total"] += step_total_time
                     perf_window["data_wait"] += data_wait_time
                     perf_window["all_reduce"] += all_reduce_time
+                    perf_window["all_reduce_calls"] += all_reduce_calls
+                    perf_window["all_reduce_bytes"] += all_reduce_bytes
                     perf_window["optim"] += optim_time
                     perf_window["compute"] += compute_time
                     if accelerator.sync_gradients:
@@ -1099,13 +1161,20 @@ class NetworkTrainer:
                         avg_optim_ms = (perf_window["optim"] / perf_window["steps"]) * 1000.0
                         local_sps = perf_window["samples"] / total if perf_window["samples"] > 0 else 0.0
                         global_sps = local_sps * accelerator.num_processes
+                        reduce_mib = perf_window["all_reduce_bytes"] / (1024 * 1024)
+                        reduce_mib_s = (
+                            (perf_window["all_reduce_bytes"] / max(perf_window["all_reduce"], 1e-9)) / (1024 * 1024)
+                            if perf_window["all_reduce"] > 0
+                            else 0.0
+                        )
 
                         logger.info(
                             "[perf] bottleneck window: "
                             f"steps={perf_window['steps']}, opt_steps={perf_window['opt_steps']}, "
                             f"avg_step={avg_step_ms:.1f}ms, wait={avg_wait_ms:.1f}ms({perf_window['data_wait'] / total * 100:.1f}%), "
                             f"compute={avg_compute_ms:.1f}ms({perf_window['compute'] / total * 100:.1f}%), "
-                            f"all_reduce={avg_reduce_ms:.1f}ms({perf_window['all_reduce'] / total * 100:.1f}%), "
+                            f"all_reduce={avg_reduce_ms:.1f}ms({perf_window['all_reduce'] / total * 100:.1f}%, "
+                            f"calls={perf_window['all_reduce_calls']}, volume={reduce_mib:.1f}MiB, eff_bw={reduce_mib_s:.1f}MiB/s), "
                             f"optim={avg_optim_ms:.1f}ms({perf_window['optim'] / total * 100:.1f}%), "
                             f"samples/s(local)={local_sps:.2f}, samples/s(global_est)={global_sps:.2f}"
                         )
@@ -1116,6 +1185,8 @@ class NetworkTrainer:
                             "step_total": 0.0,
                             "data_wait": 0.0,
                             "all_reduce": 0.0,
+                            "all_reduce_calls": 0,
+                            "all_reduce_bytes": 0,
                             "optim": 0.0,
                             "compute": 0.0,
                         }
