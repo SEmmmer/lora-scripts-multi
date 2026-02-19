@@ -5,6 +5,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -203,6 +204,27 @@ def _get_latest_remote_toml(
     return path or None
 
 
+def _find_first_remote_file(
+    remote_host: str,
+    ssh_port: int,
+    candidates: list,
+    *,
+    use_password_auth: bool = False,
+    ssh_password: str = "",
+) -> Optional[str]:
+    for path in candidates:
+        path_type = _remote_path_type(
+            remote_host,
+            ssh_port,
+            path,
+            use_password_auth=use_password_auth,
+            ssh_password=ssh_password,
+        )
+        if path_type == "file":
+            return path
+    return None
+
+
 def _sync_config_from_main(
     toml_path: str,
     remote_host: str,
@@ -227,8 +249,29 @@ def _sync_config_from_main(
             ssh_password=ssh_password,
         )
 
+        if not main_toml_path:
+            local_toml_name = Path(toml_path).name
+            candidate_paths = [
+                str(Path(remote_repo_root) / "config" / "autosave" / "distributed-main-latest.toml"),
+                str(Path(remote_repo_root) / "config" / "autosave" / local_toml_name),
+                str(Path(remote_repo_root) / "config" / "default.toml"),
+                str(Path(remote_repo_root) / "config" / "lora.toml"),
+            ]
+            main_toml_path = _find_first_remote_file(
+                remote_host,
+                ssh_port,
+                candidate_paths,
+                use_password_auth=use_password_auth,
+                ssh_password=ssh_password,
+            )
+
     if not main_toml_path:
-        return False, "无法获取主机 toml 配置文件路径"
+        return (
+            False,
+            "无法获取主机 toml 配置文件路径。请先在主机启动一次训练生成 autosave，"
+            "或在 sync_main_toml 中填写主机 toml 绝对路径。"
+            f"remote_host={remote_host}, remote_repo_root={remote_repo_root}",
+        )
 
     log.info(f"[sync-config] use main toml: {main_toml_path}")
     cat_cmd = f"cat {shlex.quote(main_toml_path)}"
@@ -323,6 +366,30 @@ def _sync_missing_assets_from_main(
             return False, f"同步后本地仍不存在: {key} -> {local_path}"
         log.info(f"[sync-assets] synced: {key} -> {local_path}")
 
+    return True, ""
+
+
+def _ensure_main_distributed_autosave(toml_path: str, machine_rank: int, num_machines: int) -> Tuple[bool, str]:
+    if num_machines <= 1 or machine_rank != 0:
+        return True, ""
+
+    src = Path(toml_path)
+    if not src.exists():
+        return False, f"主机分布式 autosave 源文件不存在: {src}"
+
+    autosave_dir = base_dir_path() / "config" / "autosave"
+    autosave_dir.mkdir(parents=True, exist_ok=True)
+
+    latest_file = autosave_dir / "distributed-main-latest.toml"
+    timestamp_file = autosave_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-distributed-main.toml"
+    try:
+        shutil.copy2(src, latest_file)
+        shutil.copy2(src, timestamp_file)
+    except Exception as e:
+        return False, f"主机分布式 autosave 写入失败: {e}"
+
+    log.info(f"[sync-config] main distributed autosave updated: {latest_file}")
+    log.info(f"[sync-config] main distributed autosave snapshot: {timestamp_file}")
     return True, ""
 
 
@@ -441,6 +508,14 @@ def run_train(toml_path: str,
         customize_env["NCCL_SOCKET_IFNAME"] = nccl_socket_ifname
     if gloo_socket_ifname:
         customize_env["GLOO_SOCKET_IFNAME"] = gloo_socket_ifname
+
+    ok, message = _ensure_main_distributed_autosave(
+        toml_path=toml_path,
+        machine_rank=machine_rank,
+        num_machines=num_machines,
+    )
+    if not ok:
+        return APIResponse(status="error", message=f"主机分布式 autosave 失败: {message}")
 
     is_worker = num_machines > 1 and machine_rank > 0
     if is_worker:
