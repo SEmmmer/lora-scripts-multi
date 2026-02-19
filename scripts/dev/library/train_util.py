@@ -3341,6 +3341,53 @@ def get_git_revision_hash() -> str:
 
 
 #     diffusers.models.attention.CrossAttention.forward = forward_xformers
+def resolve_attention_backend(mem_eff_attn, xformers, sdpa):
+    if not xformers:
+        return mem_eff_attn, xformers, sdpa
+
+    force_xformers = os.environ.get("MIKAZUKI_FORCE_XFORMERS", "").strip().lower() in {"1", "true", "yes", "on"}
+    if force_xformers:
+        logger.warning("MIKAZUKI_FORCE_XFORMERS is enabled, skip xformers compatibility check")
+        return mem_eff_attn, xformers, sdpa
+
+    if not torch.cuda.is_available():
+        fallback_sdpa = sdpa or not mem_eff_attn
+        logger.warning("xformers requested but CUDA is not available, fallback to SDPA")
+        return mem_eff_attn, False, fallback_sdpa
+
+    reason = None
+    try:
+        major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    except Exception:
+        major, minor = torch.cuda.get_device_capability()
+
+    if major >= 12:
+        # Current public xformers wheels are often behind newest GPU architectures.
+        reason = f"unsupported GPU compute capability {major}.{minor}"
+
+    if reason is None:
+        try:
+            import xformers.ops as xops
+
+            q = torch.randn((1, 8, 1, 64), device="cuda", dtype=torch.float16)
+            with torch.no_grad():
+                _ = xops.memory_efficient_attention(q, q, q, attn_bias=None)
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+        finally:
+            if "q" in locals():
+                del q
+            if "_" in locals():
+                del _
+
+    if reason is not None:
+        fallback_sdpa = sdpa or not mem_eff_attn
+        logger.warning(f"xformers is disabled automatically ({reason}); fallback to SDPA={fallback_sdpa}")
+        return mem_eff_attn, False, fallback_sdpa
+
+    return mem_eff_attn, xformers, sdpa
+
+
 def replace_unet_modules(unet: UNet2DConditionModel, mem_eff_attn, xformers, sdpa):
     if mem_eff_attn:
         logger.info("Enable memory efficient attention for U-Net")

@@ -179,6 +179,9 @@ class NetworkTrainer:
         text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
 
         # モデルに xformers とか memory efficient attention を組み込む
+        args.mem_eff_attn, args.xformers, args.sdpa = train_util.resolve_attention_backend(
+            args.mem_eff_attn, args.xformers, args.sdpa
+        )
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
         if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
             vae.set_use_memory_efficient_attention_xformers(args.xformers)
