@@ -1332,7 +1332,7 @@ class NetworkTrainer:
         clean_memory_on_device(accelerator.device)
 
         progress_bar = tqdm(
-            range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
+            range(args.max_train_steps - initial_step), smoothing=0.5, disable=not accelerator.is_local_main_process, desc="steps"
         )
 
         validation_steps = (
@@ -1518,7 +1518,7 @@ class NetworkTrainer:
 
                     val_progress_bar = tqdm(
                         range(validation_total_steps),
-                        smoothing=0,
+                        smoothing=0.5,
                         disable=not accelerator.is_local_main_process,
                         desc="validation steps",
                     )
@@ -1594,7 +1594,7 @@ class NetworkTrainer:
 
                 val_progress_bar = tqdm(
                     range(validation_total_steps),
-                    smoothing=0,
+                    smoothing=0.5,
                     disable=not accelerator.is_local_main_process,
                     desc="epoch validation steps",
                 )

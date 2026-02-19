@@ -69,25 +69,84 @@ def _run_cmd(cmd: list, desc: str):
     return result
 
 
-def _ssh(remote_host: str, ssh_port: int, remote_cmd: str, desc: str):
-    cmd = ["ssh", "-p", str(ssh_port), remote_host, remote_cmd]
+def _ssh_options(use_password_auth: bool):
+    options = ["-o", "StrictHostKeyChecking=accept-new"]
+    if use_password_auth:
+        options += [
+            "-o", "PubkeyAuthentication=no",
+            "-o", "PreferredAuthentications=password,keyboard-interactive",
+        ]
+    return options
+
+
+def _with_sshpass(cmd: list, use_password_auth: bool, ssh_password: str, desc: str):
+    if not use_password_auth:
+        return cmd
+
+    if not ssh_password:
+        log.error(f"{desc} failed: password auth is enabled but ssh password is empty")
+        return None
+
+    if shutil.which("sshpass") is None:
+        log.error(f"{desc} failed: `sshpass` is required for password auth, please install sshpass")
+        return None
+
+    return ["sshpass", "-p", ssh_password, *cmd]
+
+
+def _ssh(
+    remote_host: str,
+    ssh_port: int,
+    remote_cmd: str,
+    desc: str,
+    *,
+    use_password_auth: bool = False,
+    ssh_password: str = "",
+):
+    cmd = ["ssh", "-p", str(ssh_port), *_ssh_options(use_password_auth), remote_host, remote_cmd]
+    cmd = _with_sshpass(cmd, use_password_auth, ssh_password, desc)
+    if cmd is None:
+        return None
     return _run_cmd(cmd, desc)
 
 
-def _remote_path_type(remote_host: str, ssh_port: int, remote_path: str) -> str:
+def _remote_path_type(
+    remote_host: str,
+    ssh_port: int,
+    remote_path: str,
+    *,
+    use_password_auth: bool = False,
+    ssh_password: str = "",
+) -> str:
     probe_cmd = (
         f"if [ -d {shlex.quote(remote_path)} ]; then echo dir; "
         f"elif [ -f {shlex.quote(remote_path)} ]; then echo file; "
         "else echo missing; fi"
     )
-    result = _ssh(remote_host, ssh_port, probe_cmd, f"[sync] probing remote path {remote_path}")
+    result = _ssh(
+        remote_host,
+        ssh_port,
+        probe_cmd,
+        f"[sync] probing remote path {remote_path}",
+        use_password_auth=use_password_auth,
+        ssh_password=ssh_password,
+    )
     if result is None:
         return "error"
     value = result.stdout.strip().splitlines()
     return value[-1] if value else "error"
 
 
-def _copy_remote_path(remote_host: str, ssh_port: int, remote_path: str, local_path: Path, path_type: str) -> bool:
+def _copy_remote_path(
+    remote_host: str,
+    ssh_port: int,
+    remote_path: str,
+    local_path: Path,
+    path_type: str,
+    *,
+    use_password_auth: bool = False,
+    ssh_password: str = "",
+) -> bool:
     src = f"{remote_host}:{remote_path.rstrip('/')}/" if path_type == "dir" else f"{remote_host}:{remote_path}"
 
     if shutil.which("rsync"):
@@ -98,24 +157,46 @@ def _copy_remote_path(remote_host: str, ssh_port: int, remote_path: str, local_p
             local_path.parent.mkdir(parents=True, exist_ok=True)
             dst = str(local_path)
 
-        rsync_cmd = ["rsync", "-a", "--partial", "-e", f"ssh -p {ssh_port}", src, dst]
+        ssh_exec = " ".join(["ssh", "-p", str(ssh_port), *_ssh_options(use_password_auth)])
+        rsync_cmd = ["rsync", "-a", "--partial", "-e", ssh_exec, src, dst]
+        rsync_cmd = _with_sshpass(rsync_cmd, use_password_auth, ssh_password, f"[sync] rsync {remote_path} -> {local_path}")
+        if rsync_cmd is None:
+            return False
         if _run_cmd(rsync_cmd, f"[sync] rsync {remote_path} -> {local_path}") is not None:
             return True
         log.warning("[sync] rsync failed, fallback to scp")
 
+    scp_base_cmd = ["scp", "-P", str(ssh_port), *_ssh_options(use_password_auth)]
     if path_type == "dir":
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        scp_cmd = ["scp", "-P", str(ssh_port), "-r", src.rstrip("/"), str(local_path.parent)]
+        scp_cmd = [*scp_base_cmd, "-r", src.rstrip("/"), str(local_path.parent)]
     else:
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        scp_cmd = ["scp", "-P", str(ssh_port), src, str(local_path)]
+        scp_cmd = [*scp_base_cmd, src, str(local_path)]
+    scp_cmd = _with_sshpass(scp_cmd, use_password_auth, ssh_password, f"[sync] scp {remote_path} -> {local_path}")
+    if scp_cmd is None:
+        return False
     return _run_cmd(scp_cmd, f"[sync] scp {remote_path} -> {local_path}") is not None
 
 
-def _get_latest_remote_toml(remote_host: str, ssh_port: int, remote_repo_root: str) -> Optional[str]:
+def _get_latest_remote_toml(
+    remote_host: str,
+    ssh_port: int,
+    remote_repo_root: str,
+    *,
+    use_password_auth: bool = False,
+    ssh_password: str = "",
+) -> Optional[str]:
     autosave_dir = str(Path(remote_repo_root) / "config" / "autosave")
     remote_cmd = f"ls -1t {shlex.quote(autosave_dir)}/*.toml 2>/dev/null | head -n1"
-    result = _ssh(remote_host, ssh_port, remote_cmd, "[sync-config] detect latest main toml")
+    result = _ssh(
+        remote_host,
+        ssh_port,
+        remote_cmd,
+        "[sync-config] detect latest main toml",
+        use_password_auth=use_password_auth,
+        ssh_password=ssh_password,
+    )
     if result is None:
         return None
     path = result.stdout.strip()
@@ -129,20 +210,36 @@ def _sync_config_from_main(
     remote_repo_root: str,
     sync_main_toml: str,
     sync_keys: list,
+    *,
+    use_password_auth: bool = False,
+    ssh_password: str = "",
 ) -> Tuple[bool, str]:
     local_config = toml.load(toml_path)
 
     if sync_main_toml:
         main_toml_path = _resolve_remote_path(sync_main_toml, remote_repo_root)
     else:
-        main_toml_path = _get_latest_remote_toml(remote_host, ssh_port, remote_repo_root)
+        main_toml_path = _get_latest_remote_toml(
+            remote_host,
+            ssh_port,
+            remote_repo_root,
+            use_password_auth=use_password_auth,
+            ssh_password=ssh_password,
+        )
 
     if not main_toml_path:
         return False, "无法获取主机 toml 配置文件路径"
 
     log.info(f"[sync-config] use main toml: {main_toml_path}")
     cat_cmd = f"cat {shlex.quote(main_toml_path)}"
-    result = _ssh(remote_host, ssh_port, cat_cmd, f"[sync-config] read main toml {main_toml_path}")
+    result = _ssh(
+        remote_host,
+        ssh_port,
+        cat_cmd,
+        f"[sync-config] read main toml {main_toml_path}",
+        use_password_auth=use_password_auth,
+        ssh_password=ssh_password,
+    )
     if result is None:
         return False, f"无法读取主机 toml 文件: {main_toml_path}"
 
@@ -181,6 +278,9 @@ def _sync_missing_assets_from_main(
     ssh_port: int,
     remote_repo_root: str,
     asset_keys: list,
+    *,
+    use_password_auth: bool = False,
+    ssh_password: str = "",
 ) -> Tuple[bool, str]:
     local_repo_root = base_dir_path()
     config = toml.load(toml_path)
@@ -196,14 +296,28 @@ def _sync_missing_assets_from_main(
             continue
 
         remote_path = _resolve_remote_path(value, remote_repo_root)
-        path_type = _remote_path_type(remote_host, ssh_port, remote_path)
+        path_type = _remote_path_type(
+            remote_host,
+            ssh_port,
+            remote_path,
+            use_password_auth=use_password_auth,
+            ssh_password=ssh_password,
+        )
         if path_type == "missing":
             return False, f"主机路径不存在，无法同步: {key} -> {remote_path}"
         if path_type == "error":
             return False, f"无法探测主机路径类型: {key} -> {remote_path}"
 
         log.info(f"[sync-assets] local missing, start sync: {key} -> {local_path}")
-        if not _copy_remote_path(remote_host, ssh_port, remote_path, local_path, path_type):
+        if not _copy_remote_path(
+            remote_host,
+            ssh_port,
+            remote_path,
+            local_path,
+            path_type,
+            use_password_auth=use_password_auth,
+            ssh_password=ssh_password,
+        ):
             return False, f"同步失败: {key} -> {remote_path}"
         if not local_path.exists():
             return False, f"同步后本地仍不存在: {key} -> {local_path}"
@@ -304,6 +418,10 @@ def run_train(toml_path: str,
     sync_main_toml = str(distributed_config.get("sync_main_toml", "") or "").strip()
     sync_ssh_user = str(distributed_config.get("sync_ssh_user", "") or "").strip()
     sync_ssh_port = int(distributed_config.get("sync_ssh_port", 22) or 22)
+    sync_use_password_auth = _to_bool(distributed_config.get("sync_use_password_auth"), True)
+    sync_ssh_password = str(
+        distributed_config.get("sync_ssh_password", "") or os.environ.get("MIKAZUKI_SYNC_SSH_PASSWORD", "")
+    ).strip()
     num_processes_per_machine = distributed_config.get("num_processes")
     if num_processes_per_machine is None:
         num_processes_per_machine = len(gpu_ids) if gpu_ids else 1
@@ -327,6 +445,11 @@ def run_train(toml_path: str,
     is_worker = num_machines > 1 and machine_rank > 0
     if is_worker:
         remote_host = f"{sync_ssh_user}@{main_process_ip}" if sync_ssh_user else str(main_process_ip)
+        if sync_use_password_auth and not sync_ssh_password:
+            return APIResponse(
+                status="error",
+                message="已启用密码认证同步，但未提供密码。请在分布式设置填写 sync_ssh_password 或设置环境变量 MIKAZUKI_SYNC_SSH_PASSWORD。",
+            )
         if sync_config_from_main:
             log.info("[sync-config] worker sync from main is enabled")
             ok, message = _sync_config_from_main(
@@ -336,6 +459,8 @@ def run_train(toml_path: str,
                 remote_repo_root=sync_main_repo_dir,
                 sync_main_toml=sync_main_toml,
                 sync_keys=sync_config_keys_from_main,
+                use_password_auth=sync_use_password_auth,
+                ssh_password=sync_ssh_password,
             )
             if not ok:
                 return APIResponse(status="error", message=f"配置同步失败: {message}")
@@ -348,6 +473,8 @@ def run_train(toml_path: str,
                 ssh_port=sync_ssh_port,
                 remote_repo_root=sync_main_repo_dir,
                 asset_keys=sync_asset_keys,
+                use_password_auth=sync_use_password_auth,
+                ssh_password=sync_ssh_password,
             )
             if not ok:
                 return APIResponse(status="error", message=f"资产同步失败: {message}")

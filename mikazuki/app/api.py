@@ -153,6 +153,8 @@ async def create_toml_file(request: Request):
         "main_process_port": config.pop("main_process_port", 29500),
         "nccl_socket_ifname": config.pop("nccl_socket_ifname", ""),
         "gloo_socket_ifname": config.pop("gloo_socket_ifname", ""),
+        "sync_use_password_auth": config.pop("sync_use_password_auth", True),
+        "sync_ssh_password": config.pop("sync_ssh_password", ""),
         "sync_config_from_main": config.pop("sync_config_from_main", True),
         "sync_config_keys_from_main": config.pop("sync_config_keys_from_main", "train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision"),
         "sync_missing_assets_from_main": config.pop("sync_missing_assets_from_main", True),

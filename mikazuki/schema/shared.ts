@@ -250,6 +250,8 @@
             sync_main_toml: Schema.string().description("主机 toml 配置文件路径。留空则自动选主机最新 autosave toml"),
             sync_ssh_user: Schema.string().description("SSH 用户名。留空则用当前用户"),
             sync_ssh_port: Schema.number().min(1).max(65535).default(22).description("SSH 端口"),
+            sync_use_password_auth: Schema.boolean().default(true).description("使用密码认证同步（通过 sshpass），关闭后使用系统默认 SSH 认证方式"),
+            sync_ssh_password: Schema.string().description("SSH 密码。建议优先使用环境变量 MIKAZUKI_SYNC_SSH_PASSWORD，避免明文保存"),
         }).description("分布式训练"),
 
     }
