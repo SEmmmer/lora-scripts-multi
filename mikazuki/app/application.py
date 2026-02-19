@@ -4,10 +4,11 @@ import os
 import sys
 import webbrowser
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException
 
@@ -31,9 +32,60 @@ else:
     FRONTEND_STATIC_DIR = None
     FRONTEND_INDEX_FILE = None
 
+_FRONTEND_APP_PATCH_NEEDLE = (
+    "schema:(v=e.extra)!=null&&v.foldable?h:{...h,meta:{...e.schema.meta,...h.meta}},"
+    "initial:e.initial,disabled:e.disabled,prefix:e.prefix,extra:{foldable:!1}"
+)
+_FRONTEND_APP_PATCH_REPLACEMENT = (
+    'schema:(v=e.extra)!=null&&v.foldable?h:{...h,meta:{...e.schema.meta,...h.meta,collapse:(h.meta&&h.meta.collapse)||'
+    '!!(e.modelValue&&Number(e.modelValue.machine_rank||0)!==0&&!(h&&h.type==="object"&&h.dict&&h.dict.machine_rank))}},'
+    "initial:e.initial,disabled:e.disabled,prefix:e.prefix,extra:{foldable:(h.meta&&h.meta.collapse)||"
+    '!!(e.modelValue&&Number(e.modelValue.machine_rank||0)!==0&&!(h&&h.type==="object"&&h.dict&&h.dict.machine_rank))}'
+)
+_patched_frontend_bundle_cache = {}
+_frontend_patch_logged = False
+
+
+def _get_patched_frontend_bundle_content(path: str) -> str | None:
+    if FRONTEND_STATIC_DIR is None:
+        return None
+
+    asset_path = Path(FRONTEND_STATIC_DIR) / path
+    if not asset_path.exists() or not asset_path.is_file():
+        return None
+
+    try:
+        mtime_ns = asset_path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+    cached = _patched_frontend_bundle_cache.get(path)
+    if cached and cached[0] == mtime_ns:
+        return cached[1]
+
+    try:
+        content = asset_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    if _FRONTEND_APP_PATCH_NEEDLE in content:
+        content = content.replace(_FRONTEND_APP_PATCH_NEEDLE, _FRONTEND_APP_PATCH_REPLACEMENT, 1)
+        global _frontend_patch_logged
+        if not _frontend_patch_logged:
+            log.info("Applied runtime frontend patch for worker-mode section auto-collapse.")
+            _frontend_patch_logged = True
+
+    _patched_frontend_bundle_cache[path] = (mtime_ns, content)
+    return content
+
 
 class SPAStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope):
+        if path.startswith("assets/app.") and path.endswith(".js"):
+            patched = _get_patched_frontend_bundle_content(path)
+            if patched is not None:
+                return Response(content=patched, media_type="application/javascript")
+
         try:
             return await super().get_response(path, scope)
         except HTTPException as ex:
