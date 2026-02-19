@@ -5435,6 +5435,23 @@ def prepare_accelerator(args: argparse.Namespace):
     if args.torch_compile:
         dynamo_backend = args.dynamo_backend
 
+    if torch.cuda.is_available():
+        local_rank_str = os.environ.get("LOCAL_RANK")
+        if local_rank_str is not None:
+            try:
+                local_rank = int(local_rank_str)
+                if 0 <= local_rank < torch.cuda.device_count():
+                    torch.cuda.set_device(local_rank)
+                    logger.info(f"set CUDA device from LOCAL_RANK: {local_rank}")
+                else:
+                    logger.warning(
+                        f"LOCAL_RANK={local_rank} is out of visible CUDA range [0, {torch.cuda.device_count() - 1}]"
+                    )
+            except ValueError:
+                logger.warning(f"invalid LOCAL_RANK value: {local_rank_str}")
+        elif torch.cuda.device_count() == 1:
+            torch.cuda.set_device(0)
+
     kwargs_handlers = [
         (
             InitProcessGroupKwargs(
@@ -6647,4 +6664,3 @@ class LossRecorder:
         if losses == 0:
             return 0
         return self.loss_total / losses
-

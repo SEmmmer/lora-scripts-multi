@@ -111,6 +111,33 @@ def _ssh(
     return _run_cmd(cmd, desc)
 
 
+def _read_remote_text_file(
+    remote_host: str,
+    ssh_port: int,
+    remote_path: str,
+    *,
+    use_password_auth: bool = False,
+    ssh_password: str = "",
+) -> Tuple[Optional[str], str]:
+    read_cmd = [
+        "ssh",
+        "-p",
+        str(ssh_port),
+        *_ssh_options(use_password_auth),
+        remote_host,
+        f"cat {shlex.quote(remote_path)}",
+    ]
+    read_cmd = _with_sshpass(read_cmd, use_password_auth, ssh_password, f"[sync-config] read remote file {remote_path}")
+    if read_cmd is None:
+        return None, "password auth command build failed"
+
+    result = subprocess.run(read_cmd, text=True, capture_output=True)
+    if result.returncode != 0:
+        err = result.stderr.strip() or "<empty>"
+        return None, err
+    return result.stdout, ""
+
+
 def _remote_path_type(
     remote_host: str,
     ssh_port: int,
@@ -238,58 +265,85 @@ def _sync_config_from_main(
 ) -> Tuple[bool, str]:
     local_config = toml.load(toml_path)
 
+    candidate_paths = []
     if sync_main_toml:
-        main_toml_path = _resolve_remote_path(sync_main_toml, remote_repo_root)
-    else:
-        main_toml_path = _get_latest_remote_toml(
-            remote_host,
-            ssh_port,
-            remote_repo_root,
-            use_password_auth=use_password_auth,
-            ssh_password=ssh_password,
-        )
+        candidate_paths.append(_resolve_remote_path(sync_main_toml, remote_repo_root))
 
-        if not main_toml_path:
-            local_toml_name = Path(toml_path).name
-            candidate_paths = [
-                str(Path(remote_repo_root) / "config" / "autosave" / "distributed-main-latest.toml"),
-                str(Path(remote_repo_root) / "config" / "autosave" / local_toml_name),
-                str(Path(remote_repo_root) / "config" / "default.toml"),
-                str(Path(remote_repo_root) / "config" / "lora.toml"),
-            ]
-            main_toml_path = _find_first_remote_file(
-                remote_host,
-                ssh_port,
-                candidate_paths,
-                use_password_auth=use_password_auth,
-                ssh_password=ssh_password,
-            )
-
-    if not main_toml_path:
-        return (
-            False,
-            "无法获取主机 toml 配置文件路径。请先在主机启动一次训练生成 autosave，"
-            "或在 sync_main_toml 中填写主机 toml 绝对路径。"
-            f"remote_host={remote_host}, remote_repo_root={remote_repo_root}",
-        )
-
-    log.info(f"[sync-config] use main toml: {main_toml_path}")
-    cat_cmd = f"cat {shlex.quote(main_toml_path)}"
-    result = _ssh(
+    latest_toml_path = _get_latest_remote_toml(
         remote_host,
         ssh_port,
-        cat_cmd,
-        f"[sync-config] read main toml {main_toml_path}",
+        remote_repo_root,
         use_password_auth=use_password_auth,
         ssh_password=ssh_password,
     )
-    if result is None:
-        return False, f"无法读取主机 toml 文件: {main_toml_path}"
+    if latest_toml_path:
+        candidate_paths.append(latest_toml_path)
 
-    try:
-        main_config = toml.loads(result.stdout)
-    except Exception as e:
-        return False, f"解析主机 toml 失败: {e}"
+    local_toml_name = Path(toml_path).name
+    candidate_paths.extend(
+        [
+            str(Path(remote_repo_root) / "config" / "autosave" / "distributed-main-latest.toml"),
+            str(Path(remote_repo_root) / "config" / "autosave" / local_toml_name),
+            str(Path(remote_repo_root) / "config" / "default.toml"),
+            str(Path(remote_repo_root) / "config" / "lora.toml"),
+        ]
+    )
+
+    # Deduplicate while preserving order.
+    dedup_paths = []
+    seen = set()
+    for p in candidate_paths:
+        if p not in seen:
+            dedup_paths.append(p)
+            seen.add(p)
+
+    if len(dedup_paths) == 0:
+        return False, f"无法构建主机 toml 候选路径。remote_host={remote_host}, remote_repo_root={remote_repo_root}"
+
+    main_config = None
+    used_toml_path = None
+    errors = []
+    for candidate in dedup_paths:
+        path_type = _remote_path_type(
+            remote_host,
+            ssh_port,
+            candidate,
+            use_password_auth=use_password_auth,
+            ssh_password=ssh_password,
+        )
+        if path_type != "file":
+            errors.append(f"{candidate} ({path_type})")
+            continue
+
+        text, read_err = _read_remote_text_file(
+            remote_host,
+            ssh_port,
+            candidate,
+            use_password_auth=use_password_auth,
+            ssh_password=ssh_password,
+        )
+        if text is None:
+            errors.append(f"{candidate} (read failed: {read_err})")
+            continue
+
+        try:
+            parsed = toml.loads(text)
+        except Exception as e:
+            errors.append(f"{candidate} (toml parse failed: {e})")
+            continue
+
+        main_config = parsed
+        used_toml_path = candidate
+        break
+
+    if main_config is None:
+        return (
+            False,
+            "无法读取主机 toml 配置。请检查 sync_main_repo_dir / sync_main_toml / SSH 密码权限。"
+            f"remote_host={remote_host}, remote_repo_root={remote_repo_root}, attempts={'; '.join(errors)}",
+        )
+
+    log.info(f"[sync-config] use main toml: {used_toml_path}")
 
     changed = 0
     for key in sync_keys:
