@@ -25,6 +25,7 @@ LEGACY_DEFAULT_SYNC_CONFIG_KEYS = (
 DEFAULT_SYNC_CONFIG_KEYS = "*"
 DEFAULT_SYNC_ASSET_KEYS = "pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume"
 WORKER_OUTPUT_MARKER = "THIS_IS_WORKER_NODE_CHECK_MAIN_OUTPUTS"
+DATASET_DIR_KEYS = ("train_data_dir", "reg_data_dir")
 
 
 def _to_bool(value, default=False):
@@ -61,6 +62,223 @@ def _parse_sync_config_keys(value):
         return ["*"]
 
     return keys
+
+
+def _get_dataset_dirs_from_toml(toml_path: str):
+    repo_root = base_dir_path()
+    config = toml.load(toml_path)
+    dataset_dirs = []
+    seen = set()
+
+    for key in DATASET_DIR_KEYS:
+        value = config.get(key)
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        if not value:
+            continue
+
+        local_path = _resolve_local_path(value, repo_root)
+        local_norm = str(local_path)
+        if local_norm in seen:
+            continue
+        seen.add(local_norm)
+        dataset_dirs.append((key, value, local_path))
+
+    return dataset_dirs
+
+
+def _count_local_dataset_files_without_npz(local_dir: Path) -> int:
+    if not local_dir.exists():
+        return 0
+    if not local_dir.is_dir():
+        return -1
+
+    count = 0
+    for path in local_dir.rglob("*"):
+        if path.is_file() and path.suffix.lower() != ".npz":
+            count += 1
+    return count
+
+
+def _count_remote_dataset_files_without_npz(
+    remote_host: str,
+    ssh_port: int,
+    remote_dir: str,
+    *,
+    use_password_auth: bool = False,
+    ssh_password: str = "",
+) -> int:
+    remote_cmd = (
+        f"if [ -d {shlex.quote(remote_dir)} ]; then "
+        f"find {shlex.quote(remote_dir)} -type f ! -iname '*.npz' | wc -l; "
+        "else echo -1; fi"
+    )
+    result = _ssh(
+        remote_host,
+        ssh_port,
+        remote_cmd,
+        f"[dataset-sync] count remote files {remote_dir}",
+        use_password_auth=use_password_auth,
+        ssh_password=ssh_password,
+    )
+    if result is None:
+        return -2
+
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return -2
+
+    try:
+        return int(lines[-1])
+    except Exception:
+        return -2
+
+
+def _sync_dataset_dir_from_main(
+    remote_host: str,
+    ssh_port: int,
+    remote_dir: str,
+    local_dir: Path,
+    *,
+    use_password_auth: bool = False,
+    ssh_password: str = "",
+) -> Tuple[bool, str]:
+    if shutil.which("rsync") is None:
+        return False, "缺少 rsync，无法执行数据集同步"
+
+    local_dir.mkdir(parents=True, exist_ok=True)
+    ssh_exec = " ".join(["ssh", "-p", str(ssh_port), *_ssh_options(use_password_auth)])
+    rsync_cmd = [
+        "rsync",
+        "-a",
+        "--partial",
+        "--delete",
+        "--exclude",
+        "*.npz",
+        "--exclude",
+        "*.NPZ",
+        "-e",
+        ssh_exec,
+        f"{remote_host}:{remote_dir.rstrip('/')}/",
+        f"{str(local_dir)}/",
+    ]
+    rsync_cmd = _with_sshpass(
+        rsync_cmd,
+        use_password_auth,
+        ssh_password,
+        f"[dataset-sync] rsync {remote_dir} -> {local_dir}",
+    )
+    if rsync_cmd is None:
+        return False, "无法构建密码认证 rsync 命令"
+
+    if _run_cmd(rsync_cmd, f"[dataset-sync] rsync {remote_dir} -> {local_dir}") is None:
+        return False, f"数据集同步失败: {remote_dir}"
+    return True, ""
+
+
+def _sync_datasets_when_count_mismatch_from_main(
+    toml_path: str,
+    remote_host: str,
+    ssh_port: int,
+    remote_repo_root: str,
+    *,
+    use_password_auth: bool = False,
+    ssh_password: str = "",
+) -> Tuple[bool, str]:
+    dataset_dirs = _get_dataset_dirs_from_toml(toml_path)
+    if not dataset_dirs:
+        log.info("[dataset-sync] no dataset dir found in toml, skip count sync")
+        return True, ""
+
+    for key, raw_value, local_dir in dataset_dirs:
+        remote_dir = _resolve_remote_path(raw_value, remote_repo_root)
+        remote_type = _remote_path_type(
+            remote_host,
+            ssh_port,
+            remote_dir,
+            use_password_auth=use_password_auth,
+            ssh_password=ssh_password,
+        )
+        if remote_type == "missing":
+            return False, f"主机数据集目录不存在: {key} -> {remote_dir}"
+        if remote_type != "dir":
+            return False, f"主机数据集路径不是目录: {key} -> {remote_dir} ({remote_type})"
+
+        local_count = _count_local_dataset_files_without_npz(local_dir)
+        if local_count < 0:
+            return False, f"本地数据集路径不是目录: {local_dir}"
+        remote_count = _count_remote_dataset_files_without_npz(
+            remote_host,
+            ssh_port,
+            remote_dir,
+            use_password_auth=use_password_auth,
+            ssh_password=ssh_password,
+        )
+        if remote_count < 0:
+            return False, f"无法统计主机数据集文件数量: {remote_dir}"
+
+        log.info(
+            f"[dataset-sync] {key}: local_count={local_count}, remote_count={remote_count}, "
+            f"local_dir={local_dir}, remote_dir={remote_dir}"
+        )
+        if local_count == remote_count:
+            log.info(f"[dataset-sync] {key}: file count already matched, skip sync")
+            continue
+
+        log.warning(
+            f"[dataset-sync] {key}: count mismatch detected, syncing dataset from main "
+            f"(local={local_count}, remote={remote_count})"
+        )
+        ok, message = _sync_dataset_dir_from_main(
+            remote_host,
+            ssh_port,
+            remote_dir,
+            local_dir,
+            use_password_auth=use_password_auth,
+            ssh_password=ssh_password,
+        )
+        if not ok:
+            return False, message
+
+        local_after = _count_local_dataset_files_without_npz(local_dir)
+        if local_after != remote_count:
+            return (
+                False,
+                f"数据集同步后文件数仍不一致: {key}, local_after={local_after}, remote={remote_count}",
+            )
+        log.info(f"[dataset-sync] {key}: sync completed, count={local_after}")
+
+    return True, ""
+
+
+def _clear_dataset_npz_cache(toml_path: str) -> Tuple[bool, str]:
+    dataset_dirs = _get_dataset_dirs_from_toml(toml_path)
+    if not dataset_dirs:
+        log.info("[cache-reset] no dataset dir found in toml, skip npz cleanup")
+        return True, ""
+
+    total_removed = 0
+    for key, _, local_dir in dataset_dirs:
+        if not local_dir.exists():
+            log.info(f"[cache-reset] {key}: dataset dir not found, skip npz cleanup: {local_dir}")
+            continue
+        if not local_dir.is_dir():
+            return False, f"数据集路径不是目录，无法清理 npz: {local_dir}"
+
+        removed = 0
+        for npz_file in local_dir.rglob("*.npz"):
+            try:
+                npz_file.unlink()
+                removed += 1
+            except Exception as e:
+                return False, f"删除缓存失败: {npz_file} ({e})"
+
+        total_removed += removed
+        log.info(f"[cache-reset] {key}: removed {removed} npz files under {local_dir}")
+
+    log.info(f"[cache-reset] removed total npz files: {total_removed}")
+    return True, ""
 
 
 def _resolve_local_path(path_value: str, repo_root: Path) -> Path:
@@ -627,6 +845,23 @@ def run_train(toml_path: str,
             )
             if not ok:
                 return APIResponse(status="error", message=f"资产同步失败: {message}")
+
+        log.info("[dataset-sync] worker checking dataset count mismatch with main")
+        ok, message = _sync_datasets_when_count_mismatch_from_main(
+            toml_path=toml_path,
+            remote_host=remote_host,
+            ssh_port=sync_ssh_port,
+            remote_repo_root=sync_main_repo_dir,
+            use_password_auth=sync_use_password_auth,
+            ssh_password=sync_ssh_password,
+        )
+        if not ok:
+            return APIResponse(status="error", message=f"数据集同步失败: {message}")
+
+    log.info("[cache-reset] clearing dataset npz cache before launch")
+    ok, message = _clear_dataset_npz_cache(toml_path=toml_path)
+    if not ok:
+        return APIResponse(status="error", message=f"缓存清理失败: {message}")
 
     ok, message = _enforce_distributed_output_policy(toml_path=toml_path, machine_rank=machine_rank)
     if not ok:
