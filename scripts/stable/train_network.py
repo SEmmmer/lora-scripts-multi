@@ -813,6 +813,27 @@ class NetworkTrainer:
             range(args.max_train_steps - initial_step), smoothing=0.5, disable=not accelerator.is_local_main_process, desc="steps"
         )
 
+        perf_enabled = str(os.environ.get("MIKAZUKI_PERF_INDICATOR", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            perf_log_interval = max(1, int(os.environ.get("MIKAZUKI_PERF_LOG_INTERVAL", "20")))
+        except Exception:
+            perf_log_interval = 20
+        perf_window = {
+            "steps": 0,
+            "opt_steps": 0,
+            "samples": 0,
+            "step_total": 0.0,
+            "data_wait": 0.0,
+            "all_reduce": 0.0,
+            "optim": 0.0,
+            "compute": 0.0,
+        }
+        if perf_enabled and accelerator.is_local_main_process:
+            logger.info(
+                f"[perf] enabled bottleneck indicator: log_interval={perf_log_interval}, "
+                f"num_processes={accelerator.num_processes}"
+            )
+
         epoch_to_start = 0
         if initial_step > 0:
             if args.skip_until_initial_step:
@@ -908,12 +929,18 @@ class NetworkTrainer:
                 skipped_dataloader = accelerator.skip_first_batches(train_dataloader, initial_step - 1)
                 initial_step = 1
 
+            prev_step_finished_at = time.perf_counter()
             for step, batch in enumerate(skipped_dataloader or train_dataloader):
+                loop_started_at = time.perf_counter()
+                data_wait_time = max(loop_started_at - prev_step_finished_at, 0.0)
                 current_step.value = global_step
                 if initial_step > 0:
                     initial_step -= 1
+                    prev_step_finished_at = time.perf_counter()
                     continue
 
+                all_reduce_time = 0.0
+                optim_time = 0.0
                 with accelerator.accumulate(training_model):
                     on_step_start(text_encoder, unet)
 
@@ -1012,14 +1039,38 @@ class NetworkTrainer:
 
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
+                        all_reduce_started_at = time.perf_counter()
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
+                        all_reduce_time += time.perf_counter() - all_reduce_started_at
                         if args.max_grad_norm != 0.0:
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
+                    optim_started_at = time.perf_counter()
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    optim_time += time.perf_counter() - optim_started_at
+
+                loop_ended_at = time.perf_counter()
+                step_total_time = max(loop_ended_at - loop_started_at, 0.0)
+                compute_time = max(step_total_time - data_wait_time - all_reduce_time - optim_time, 0.0)
+                batch_size_hint = 0
+                if "images" in batch and batch["images"] is not None:
+                    batch_size_hint = int(batch["images"].shape[0])
+                elif "latents" in batch and batch["latents"] is not None:
+                    batch_size_hint = int(batch["latents"].shape[0])
+
+                if perf_enabled:
+                    perf_window["steps"] += 1
+                    perf_window["samples"] += batch_size_hint
+                    perf_window["step_total"] += step_total_time
+                    perf_window["data_wait"] += data_wait_time
+                    perf_window["all_reduce"] += all_reduce_time
+                    perf_window["optim"] += optim_time
+                    perf_window["compute"] += compute_time
+                    if accelerator.sync_gradients:
+                        perf_window["opt_steps"] += 1
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
@@ -1033,6 +1084,41 @@ class NetworkTrainer:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
+
+                    if (
+                        perf_enabled
+                        and accelerator.is_local_main_process
+                        and global_step % perf_log_interval == 0
+                        and perf_window["steps"] > 0
+                    ):
+                        total = max(perf_window["step_total"], 1e-9)
+                        avg_step_ms = (perf_window["step_total"] / perf_window["steps"]) * 1000.0
+                        avg_wait_ms = (perf_window["data_wait"] / perf_window["steps"]) * 1000.0
+                        avg_compute_ms = (perf_window["compute"] / perf_window["steps"]) * 1000.0
+                        avg_reduce_ms = (perf_window["all_reduce"] / perf_window["steps"]) * 1000.0
+                        avg_optim_ms = (perf_window["optim"] / perf_window["steps"]) * 1000.0
+                        local_sps = perf_window["samples"] / total if perf_window["samples"] > 0 else 0.0
+                        global_sps = local_sps * accelerator.num_processes
+
+                        logger.info(
+                            "[perf] bottleneck window: "
+                            f"steps={perf_window['steps']}, opt_steps={perf_window['opt_steps']}, "
+                            f"avg_step={avg_step_ms:.1f}ms, wait={avg_wait_ms:.1f}ms({perf_window['data_wait'] / total * 100:.1f}%), "
+                            f"compute={avg_compute_ms:.1f}ms({perf_window['compute'] / total * 100:.1f}%), "
+                            f"all_reduce={avg_reduce_ms:.1f}ms({perf_window['all_reduce'] / total * 100:.1f}%), "
+                            f"optim={avg_optim_ms:.1f}ms({perf_window['optim'] / total * 100:.1f}%), "
+                            f"samples/s(local)={local_sps:.2f}, samples/s(global_est)={global_sps:.2f}"
+                        )
+                        perf_window = {
+                            "steps": 0,
+                            "opt_steps": 0,
+                            "samples": 0,
+                            "step_total": 0.0,
+                            "data_wait": 0.0,
+                            "all_reduce": 0.0,
+                            "optim": 0.0,
+                            "compute": 0.0,
+                        }
 
                     self.sample_images(accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
@@ -1068,6 +1154,8 @@ class NetworkTrainer:
 
                 if global_step >= args.max_train_steps:
                     break
+
+                prev_step_finished_at = time.perf_counter()
 
             if args.logging_dir is not None:
                 logs = {"loss/epoch": loss_recorder.moving_average}
