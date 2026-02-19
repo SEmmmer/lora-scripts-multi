@@ -1,12 +1,10 @@
 
 import asyncio
 import os
-import re
 import shlex
 import shutil
 import subprocess
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
@@ -154,12 +152,8 @@ def _sync_dataset_dir_from_main(
     rsync_cmd = [
         "rsync",
         "-a",
-        "--whole-file",
-        "--inplace",
         "--partial",
-        "--no-compress",
         "--delete",
-        "--info=stats2",
         "--exclude",
         "*.npz",
         "--exclude",
@@ -178,11 +172,8 @@ def _sync_dataset_dir_from_main(
     if rsync_cmd is None:
         return False, "无法构建密码认证 rsync 命令"
 
-    started_at = time.perf_counter()
-    rsync_result = _run_cmd(rsync_cmd, f"[dataset-sync] rsync {remote_dir} -> {local_dir}")
-    if rsync_result is None:
+    if _run_cmd(rsync_cmd, f"[dataset-sync] rsync {remote_dir} -> {local_dir}") is None:
         return False, f"数据集同步失败: {remote_dir}"
-    _log_transfer_indicator(f"[dataset-sync] rsync {remote_dir} -> {local_dir}", started_at, rsync_result)
     return True, ""
 
 
@@ -312,71 +303,8 @@ def _run_cmd(cmd: list, desc: str):
     return result
 
 
-def _parse_number_from_text(value: str) -> Optional[float]:
-    if value is None:
-        return None
-    cleaned = re.sub(r"[^0-9.]", "", value)
-    if cleaned == "":
-        return None
-    try:
-        return float(cleaned)
-    except Exception:
-        return None
-
-
-def _parse_rsync_stats(output: str):
-    transferred_bytes = None
-    bytes_per_sec = None
-
-    for raw_line in output.splitlines():
-        line = raw_line.strip()
-        if line.lower().startswith("total transferred file size:"):
-            value = line.split(":", 1)[1].strip().split(" ")[0]
-            number = _parse_number_from_text(value)
-            if number is not None:
-                transferred_bytes = int(number)
-            continue
-
-        if "bytes/sec" in line and line.lower().startswith("sent "):
-            # sent 123 bytes  received 456 bytes  789.00 bytes/sec
-            match = re.search(
-                r"sent\s+([0-9,]+)\s+bytes\s+received\s+([0-9,]+)\s+bytes\s+([0-9,\.]+)\s+bytes/sec",
-                line,
-                re.IGNORECASE,
-            )
-            if match:
-                speed = _parse_number_from_text(match.group(3))
-                if speed is not None:
-                    bytes_per_sec = float(speed)
-
-    return transferred_bytes, bytes_per_sec
-
-
-def _log_transfer_indicator(desc: str, started_at: float, result: subprocess.CompletedProcess):
-    elapsed = max(time.perf_counter() - started_at, 1e-6)
-    merged_output = f"{result.stdout or ''}\n{result.stderr or ''}"
-    transferred_bytes, bytes_per_sec = _parse_rsync_stats(merged_output)
-
-    if transferred_bytes is None:
-        log.info(f"{desc} done in {elapsed:.2f}s")
-        return
-
-    if bytes_per_sec is None:
-        bytes_per_sec = transferred_bytes / elapsed
-
-    mib = transferred_bytes / (1024 * 1024)
-    mib_s = bytes_per_sec / (1024 * 1024)
-    mbps = bytes_per_sec * 8 / 1_000_000
-    log.info(
-        f"{desc} transferred={mib:.2f} MiB, elapsed={elapsed:.2f}s, speed={mib_s:.2f} MiB/s ({mbps:.2f} Mbps)"
-    )
-
-
 def _ssh_options(use_password_auth: bool):
-    options = ["-o", "StrictHostKeyChecking=accept-new", "-o", "Compression=no"]
-    ssh_cipher = str(os.environ.get("MIKAZUKI_SYNC_SSH_CIPHER", "") or "").strip()
-    if ssh_cipher:
-        options += ["-c", ssh_cipher]
+    options = ["-o", "StrictHostKeyChecking=accept-new"]
     if use_password_auth:
         options += [
             "-o", "PubkeyAuthentication=no",
@@ -491,26 +419,11 @@ def _copy_remote_path(
             dst = str(local_path)
 
         ssh_exec = " ".join(["ssh", "-p", str(ssh_port), *_ssh_options(use_password_auth)])
-        rsync_cmd = [
-            "rsync",
-            "-a",
-            "--whole-file",
-            "--partial",
-            "--inplace",
-            "--no-compress",
-            "--info=stats2",
-            "-e",
-            ssh_exec,
-            src,
-            dst,
-        ]
+        rsync_cmd = ["rsync", "-a", "--partial", "-e", ssh_exec, src, dst]
         rsync_cmd = _with_sshpass(rsync_cmd, use_password_auth, ssh_password, f"[sync] rsync {remote_path} -> {local_path}")
         if rsync_cmd is None:
             return False
-        started_at = time.perf_counter()
-        rsync_result = _run_cmd(rsync_cmd, f"[sync] rsync {remote_path} -> {local_path}")
-        if rsync_result is not None:
-            _log_transfer_indicator(f"[sync] rsync {remote_path} -> {local_path}", started_at, rsync_result)
+        if _run_cmd(rsync_cmd, f"[sync] rsync {remote_path} -> {local_path}") is not None:
             return True
         log.warning("[sync] rsync failed, fallback to scp")
 
@@ -856,10 +769,6 @@ def run_train(toml_path: str,
     main_process_port = int(distributed_config.get("main_process_port", 29500) or 29500)
     nccl_socket_ifname = str(distributed_config.get("nccl_socket_ifname", "") or "").strip()
     gloo_socket_ifname = str(distributed_config.get("gloo_socket_ifname", "") or "").strip()
-    nccl_socket_nthreads = str(distributed_config.get("nccl_socket_nthreads", "") or "").strip()
-    nccl_nsocks_perthread = str(distributed_config.get("nccl_nsocks_perthread", "") or "").strip()
-    nccl_ib_disable = str(distributed_config.get("nccl_ib_disable", "") or "").strip()
-    nccl_proto = str(distributed_config.get("nccl_proto", "") or "").strip()
     sync_config_from_main = _to_bool(distributed_config.get("sync_config_from_main"), True)
     sync_config_keys_from_main = _parse_sync_config_keys(distributed_config.get("sync_config_keys_from_main"))
     sync_missing_assets_from_main = _to_bool(distributed_config.get("sync_missing_assets_from_main"), True)
@@ -868,7 +777,6 @@ def run_train(toml_path: str,
     sync_main_toml = str(distributed_config.get("sync_main_toml", "") or "").strip()
     sync_ssh_user = str(distributed_config.get("sync_ssh_user", "") or "").strip()
     sync_ssh_port = int(distributed_config.get("sync_ssh_port", 22) or 22)
-    sync_ssh_cipher = str(distributed_config.get("sync_ssh_cipher", "") or "").strip()
     sync_use_password_auth = _to_bool(distributed_config.get("sync_use_password_auth"), True)
     clear_dataset_npz_before_train = _to_bool(distributed_config.get("clear_dataset_npz_before_train"), False)
     sync_ssh_password = str(
@@ -893,43 +801,6 @@ def run_train(toml_path: str,
         customize_env["NCCL_SOCKET_IFNAME"] = nccl_socket_ifname
     if gloo_socket_ifname:
         customize_env["GLOO_SOCKET_IFNAME"] = gloo_socket_ifname
-    if nccl_socket_nthreads:
-        customize_env["NCCL_SOCKET_NTHREADS"] = nccl_socket_nthreads
-    if nccl_nsocks_perthread:
-        customize_env["NCCL_NSOCKS_PERTHREAD"] = nccl_nsocks_perthread
-    if nccl_ib_disable:
-        customize_env["NCCL_IB_DISABLE"] = nccl_ib_disable
-    if nccl_proto:
-        customize_env["NCCL_PROTO"] = nccl_proto
-    if sync_ssh_cipher:
-        os.environ["MIKAZUKI_SYNC_SSH_CIPHER"] = sync_ssh_cipher
-        log.info(f"[sync] using SSH cipher override: {sync_ssh_cipher}")
-    else:
-        os.environ.pop("MIKAZUKI_SYNC_SSH_CIPHER", None)
-
-    # Multi-node defaults for TCP/WireGuard links; user-provided env/config takes precedence.
-    if num_machines > 1:
-        tuned = {}
-        for key, default_value in (
-            ("NCCL_IB_DISABLE", "1"),
-            ("NCCL_SOCKET_NTHREADS", "8"),
-            ("NCCL_NSOCKS_PERTHREAD", "4"),
-            ("NCCL_PROTO", "SIMPLE"),
-        ):
-            if key not in customize_env or str(customize_env.get(key, "")).strip() == "":
-                customize_env[key] = default_value
-                tuned[key] = default_value
-
-        if tuned:
-            log.info(f"[dist-net] applied default NCCL tuning for multinode: {tuned}")
-        log.info(
-            "[dist-net] effective NCCL env: "
-            f"NCCL_SOCKET_IFNAME={customize_env.get('NCCL_SOCKET_IFNAME', '')}, "
-            f"NCCL_SOCKET_NTHREADS={customize_env.get('NCCL_SOCKET_NTHREADS', '')}, "
-            f"NCCL_NSOCKS_PERTHREAD={customize_env.get('NCCL_NSOCKS_PERTHREAD', '')}, "
-            f"NCCL_IB_DISABLE={customize_env.get('NCCL_IB_DISABLE', '')}, "
-            f"NCCL_PROTO={customize_env.get('NCCL_PROTO', '')}"
-        )
 
     ok, message = _ensure_main_distributed_autosave(
         toml_path=toml_path,
