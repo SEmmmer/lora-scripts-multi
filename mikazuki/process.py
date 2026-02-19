@@ -870,6 +870,7 @@ def run_train(toml_path: str,
     sync_ssh_port = int(distributed_config.get("sync_ssh_port", 22) or 22)
     sync_ssh_cipher = str(distributed_config.get("sync_ssh_cipher", "") or "").strip()
     sync_use_password_auth = _to_bool(distributed_config.get("sync_use_password_auth"), True)
+    clear_dataset_npz_before_train = _to_bool(distributed_config.get("clear_dataset_npz_before_train"), False)
     sync_ssh_password = str(
         distributed_config.get("sync_ssh_password", "") or os.environ.get("MIKAZUKI_SYNC_SSH_PASSWORD", "")
     ).strip()
@@ -987,10 +988,13 @@ def run_train(toml_path: str,
         if not ok:
             return APIResponse(status="error", message=f"数据集同步失败: {message}")
 
-    log.info("[cache-reset] clearing dataset npz cache before launch")
-    ok, message = _clear_dataset_npz_cache(toml_path=toml_path)
-    if not ok:
-        return APIResponse(status="error", message=f"缓存清理失败: {message}")
+    if clear_dataset_npz_before_train:
+        log.info("[cache-reset] clearing dataset npz cache before launch (enabled by config)")
+        ok, message = _clear_dataset_npz_cache(toml_path=toml_path)
+        if not ok:
+            return APIResponse(status="error", message=f"缓存清理失败: {message}")
+    else:
+        log.info("[cache-reset] skipped dataset npz cleanup (clear_dataset_npz_before_train=false)")
 
     ok, message = _enforce_distributed_output_policy(toml_path=toml_path, machine_rank=machine_rank)
     if not ok:
