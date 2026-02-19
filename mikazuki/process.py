@@ -914,6 +914,7 @@ def run_train(toml_path: str,
             ("NCCL_IB_DISABLE", "1"),
             ("NCCL_SOCKET_NTHREADS", "8"),
             ("NCCL_NSOCKS_PERTHREAD", "4"),
+            ("NCCL_PROTO", "SIMPLE"),
         ):
             if key not in customize_env or str(customize_env.get(key, "")).strip() == "":
                 customize_env[key] = default_value
