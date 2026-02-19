@@ -64,6 +64,34 @@ def _parse_sync_config_keys(value):
     return keys
 
 
+def _list_local_network_interfaces() -> list[str]:
+    net_root = Path("/sys/class/net")
+    if not net_root.exists():
+        return []
+    try:
+        return sorted([p.name for p in net_root.iterdir() if p.is_dir()])
+    except Exception:
+        return []
+
+
+def _validate_socket_ifname(name: str, env_key: str) -> Tuple[bool, str]:
+    if not name:
+        return True, ""
+
+    interfaces = _list_local_network_interfaces()
+    if not interfaces:
+        return True, ""
+
+    if name in interfaces:
+        return True, ""
+
+    return False, (
+        f"{env_key} 配置为 '{name}'，但本机不存在该网卡。"
+        f"可用网卡: {', '.join(interfaces)}。"
+        f"请改成正确网卡名，或留空让系统自动选择。"
+    )
+
+
 def _get_dataset_dirs_from_toml(toml_path: str):
     repo_root = base_dir_path()
     config = toml.load(toml_path)
@@ -797,6 +825,13 @@ def run_train(toml_path: str,
         return APIResponse(status="error", message="多机训练时 main_process_ip 不能为空")
     if machine_rank < 0 or machine_rank >= num_machines:
         return APIResponse(status="error", message="machine_rank 超出范围，请检查 machine_rank 与 num_machines")
+    ok, message = _validate_socket_ifname(nccl_socket_ifname, "NCCL_SOCKET_IFNAME")
+    if not ok:
+        return APIResponse(status="error", message=message)
+    ok, message = _validate_socket_ifname(gloo_socket_ifname, "GLOO_SOCKET_IFNAME")
+    if not ok:
+        return APIResponse(status="error", message=message)
+
     if nccl_socket_ifname:
         customize_env["NCCL_SOCKET_IFNAME"] = nccl_socket_ifname
     if gloo_socket_ifname:

@@ -173,7 +173,7 @@ source venv/bin/activate
 适用于你当前的两台机器：
 - 主节点：`192.168.50.219`
 - Worker：`192.168.50.229`
-- 网卡：`ensp11s0`
+- 网卡：`enp11s0`
 
 仓库新增了 `train_2node.sh`，用于两台 Linux 机器一键启动分布式训练（`train.sh` / `train_by_toml.sh`）。
 
