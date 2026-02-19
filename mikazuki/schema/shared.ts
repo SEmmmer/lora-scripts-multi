@@ -242,6 +242,14 @@
             main_process_port: Schema.number().min(1).max(65535).default(29500).description("主机端口，所有机器保持一致"),
             nccl_socket_ifname: Schema.string().default("wg0").description("NCCL 通信网卡名，如 eth0 / eno1 / wg0"),
             gloo_socket_ifname: Schema.string().default("wg0").description("GLOO 通信网卡名，如 eth0 / eno1 / wg0"),
+            sync_config_from_main: Schema.boolean().default(true).description("从机启动前从主机同步关键训练参数"),
+            sync_config_keys_from_main: Schema.string().default("train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision").description("从主机同步的参数键名，逗号分隔"),
+            sync_missing_assets_from_main: Schema.boolean().default(true).description("从机若缺少底模/数据集/resume 等路径时，从主机复制到本地同路径"),
+            sync_asset_keys: Schema.string().default("pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume").description("需要检查并按需同步的路径键名，逗号分隔"),
+            sync_main_repo_dir: Schema.string().default("/home/emmmer/lora-scripts").description("主机仓库根目录（用于解析相对路径）"),
+            sync_main_toml: Schema.string().description("主机 toml 配置文件路径。留空则自动选主机最新 autosave toml"),
+            sync_ssh_user: Schema.string().description("SSH 用户名。留空则用当前用户"),
+            sync_ssh_port: Schema.number().min(1).max(65535).default(22).description("SSH 端口"),
         }).description("分布式训练"),
 
     }

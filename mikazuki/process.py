@@ -1,13 +1,273 @@
 
 import asyncio
 import os
+import shlex
+import shutil
+import subprocess
 import sys
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Tuple
+
+import toml
 
 from mikazuki.app.models import APIResponse
 from mikazuki.log import log
 from mikazuki.tasks import tm
 from mikazuki.launch_utils import base_dir_path
+
+
+DEFAULT_SYNC_CONFIG_KEYS = (
+    "train_batch_size,gradient_accumulation_steps,max_train_epochs,"
+    "learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,"
+    "network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision"
+)
+DEFAULT_SYNC_ASSET_KEYS = "pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume"
+WORKER_OUTPUT_MARKER = "THIS_IS_WORKER_NODE_CHECK_MAIN_OUTPUTS"
+
+
+def _to_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _to_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _parse_csv(value, default_csv: str):
+    raw = str(value if value is not None else default_csv)
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def _resolve_local_path(path_value: str, repo_root: Path) -> Path:
+    p = Path(path_value).expanduser()
+    if p.is_absolute():
+        return p
+    return (repo_root / p).resolve()
+
+
+def _resolve_remote_path(path_value: str, remote_repo_root: str) -> str:
+    if os.path.isabs(path_value):
+        return path_value
+    return str(Path(remote_repo_root) / path_value)
+
+
+def _run_cmd(cmd: list, desc: str):
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    if result.returncode != 0:
+        err = result.stderr.strip() or "<empty>"
+        log.error(f"{desc} failed: code={result.returncode}, stderr={err}")
+        return None
+    return result
+
+
+def _ssh(remote_host: str, ssh_port: int, remote_cmd: str, desc: str):
+    cmd = ["ssh", "-p", str(ssh_port), remote_host, remote_cmd]
+    return _run_cmd(cmd, desc)
+
+
+def _remote_path_type(remote_host: str, ssh_port: int, remote_path: str) -> str:
+    probe_cmd = (
+        f"if [ -d {shlex.quote(remote_path)} ]; then echo dir; "
+        f"elif [ -f {shlex.quote(remote_path)} ]; then echo file; "
+        "else echo missing; fi"
+    )
+    result = _ssh(remote_host, ssh_port, probe_cmd, f"[sync] probing remote path {remote_path}")
+    if result is None:
+        return "error"
+    value = result.stdout.strip().splitlines()
+    return value[-1] if value else "error"
+
+
+def _copy_remote_path(remote_host: str, ssh_port: int, remote_path: str, local_path: Path, path_type: str) -> bool:
+    src = f"{remote_host}:{remote_path.rstrip('/')}/" if path_type == "dir" else f"{remote_host}:{remote_path}"
+
+    if shutil.which("rsync"):
+        if path_type == "dir":
+            local_path.mkdir(parents=True, exist_ok=True)
+            dst = f"{str(local_path)}/"
+        else:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            dst = str(local_path)
+
+        rsync_cmd = ["rsync", "-a", "--partial", "-e", f"ssh -p {ssh_port}", src, dst]
+        if _run_cmd(rsync_cmd, f"[sync] rsync {remote_path} -> {local_path}") is not None:
+            return True
+        log.warning("[sync] rsync failed, fallback to scp")
+
+    if path_type == "dir":
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        scp_cmd = ["scp", "-P", str(ssh_port), "-r", src.rstrip("/"), str(local_path.parent)]
+    else:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        scp_cmd = ["scp", "-P", str(ssh_port), src, str(local_path)]
+    return _run_cmd(scp_cmd, f"[sync] scp {remote_path} -> {local_path}") is not None
+
+
+def _get_latest_remote_toml(remote_host: str, ssh_port: int, remote_repo_root: str) -> Optional[str]:
+    autosave_dir = str(Path(remote_repo_root) / "config" / "autosave")
+    remote_cmd = f"ls -1t {shlex.quote(autosave_dir)}/*.toml 2>/dev/null | head -n1"
+    result = _ssh(remote_host, ssh_port, remote_cmd, "[sync-config] detect latest main toml")
+    if result is None:
+        return None
+    path = result.stdout.strip()
+    return path or None
+
+
+def _sync_config_from_main(
+    toml_path: str,
+    remote_host: str,
+    ssh_port: int,
+    remote_repo_root: str,
+    sync_main_toml: str,
+    sync_keys: list,
+) -> Tuple[bool, str]:
+    local_config = toml.load(toml_path)
+
+    if sync_main_toml:
+        main_toml_path = _resolve_remote_path(sync_main_toml, remote_repo_root)
+    else:
+        main_toml_path = _get_latest_remote_toml(remote_host, ssh_port, remote_repo_root)
+
+    if not main_toml_path:
+        return False, "无法获取主机 toml 配置文件路径"
+
+    log.info(f"[sync-config] use main toml: {main_toml_path}")
+    cat_cmd = f"cat {shlex.quote(main_toml_path)}"
+    result = _ssh(remote_host, ssh_port, cat_cmd, f"[sync-config] read main toml {main_toml_path}")
+    if result is None:
+        return False, f"无法读取主机 toml 文件: {main_toml_path}"
+
+    try:
+        main_config = toml.loads(result.stdout)
+    except Exception as e:
+        return False, f"解析主机 toml 失败: {e}"
+
+    changed = 0
+    for key in sync_keys:
+        if key not in main_config:
+            log.warning(f"[sync-config] key not found on main config: {key}")
+            continue
+        old_val = local_config.get(key)
+        new_val = main_config.get(key)
+        if old_val != new_val:
+            local_config[key] = new_val
+            changed += 1
+            log.info(f"[sync-config] {key}: {old_val} -> {new_val}")
+        else:
+            log.info(f"[sync-config] {key}: unchanged ({new_val})")
+
+    if changed > 0:
+        with open(toml_path, "w", encoding="utf-8") as f:
+            f.write(toml.dumps(local_config))
+        log.info(f"[sync-config] wrote {changed} updated key(s) to {toml_path}")
+    else:
+        log.info("[sync-config] no key changes required")
+
+    return True, ""
+
+
+def _sync_missing_assets_from_main(
+    toml_path: str,
+    remote_host: str,
+    ssh_port: int,
+    remote_repo_root: str,
+    asset_keys: list,
+) -> Tuple[bool, str]:
+    local_repo_root = base_dir_path()
+    config = toml.load(toml_path)
+
+    for key in asset_keys:
+        value = config.get(key)
+        if not isinstance(value, str) or value.strip() == "":
+            continue
+
+        local_path = _resolve_local_path(value, local_repo_root)
+        if local_path.exists():
+            log.info(f"[sync-assets] local exists, skip copy: {key} -> {local_path}")
+            continue
+
+        remote_path = _resolve_remote_path(value, remote_repo_root)
+        path_type = _remote_path_type(remote_host, ssh_port, remote_path)
+        if path_type == "missing":
+            return False, f"主机路径不存在，无法同步: {key} -> {remote_path}"
+        if path_type == "error":
+            return False, f"无法探测主机路径类型: {key} -> {remote_path}"
+
+        log.info(f"[sync-assets] local missing, start sync: {key} -> {local_path}")
+        if not _copy_remote_path(remote_host, ssh_port, remote_path, local_path, path_type):
+            return False, f"同步失败: {key} -> {remote_path}"
+        if not local_path.exists():
+            return False, f"同步后本地仍不存在: {key} -> {local_path}"
+        log.info(f"[sync-assets] synced: {key} -> {local_path}")
+
+    return True, ""
+
+
+def _enforce_distributed_output_policy(toml_path: str, machine_rank: int) -> Tuple[bool, str]:
+    repo_root = base_dir_path()
+    config = toml.load(toml_path)
+    changed = False
+
+    max_train_epochs = _to_int(config.get("max_train_epochs"), 1)
+    if max_train_epochs < 1:
+        max_train_epochs = 1
+
+    if machine_rank > 0:
+        # Worker node should not create checkpoints. Keep save interval beyond this run.
+        target_save_every = max_train_epochs + 1
+        if _to_int(config.get("save_every_n_epochs"), 1) != target_save_every:
+            old = config.get("save_every_n_epochs")
+            config["save_every_n_epochs"] = target_save_every
+            changed = True
+            log.info(
+                f"[output-policy] worker disable checkpoint save: "
+                f"save_every_n_epochs {old} -> {target_save_every}"
+            )
+
+        if _to_bool(config.get("save_state"), False):
+            config["save_state"] = False
+            changed = True
+            log.info("[output-policy] worker disable save_state: True -> False")
+
+        if "save_last_n_epochs_state" in config and _to_int(config.get("save_last_n_epochs_state"), 0) != 0:
+            old = config.get("save_last_n_epochs_state")
+            config["save_last_n_epochs_state"] = 0
+            changed = True
+            log.info(f"[output-policy] worker disable save_last_n_epochs_state: {old} -> 0")
+
+        if "sample_every_n_epochs" in config:
+            sample_every = _to_int(config.get("sample_every_n_epochs"), 0)
+            target_sample_every = max_train_epochs + 1
+            if sample_every > 0 and sample_every != target_sample_every:
+                config["sample_every_n_epochs"] = target_sample_every
+                changed = True
+                log.info(
+                    f"[output-policy] worker reduce preview outputs: "
+                    f"sample_every_n_epochs {sample_every} -> {target_sample_every}"
+                )
+
+    if changed:
+        with open(toml_path, "w", encoding="utf-8") as f:
+            f.write(toml.dumps(config))
+        log.info(f"[output-policy] wrote enforced policy to {toml_path}")
+
+    if machine_rank > 0:
+        output_dir = _resolve_local_path(str(config.get("output_dir", "./output")), repo_root)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        marker_path = output_dir / WORKER_OUTPUT_MARKER
+        marker_path.touch(exist_ok=True)
+        log.info(f"[output-policy] worker marker created: {marker_path}")
+
+    return True, ""
 
 
 def run_train(toml_path: str,
@@ -36,6 +296,14 @@ def run_train(toml_path: str,
     main_process_port = int(distributed_config.get("main_process_port", 29500) or 29500)
     nccl_socket_ifname = str(distributed_config.get("nccl_socket_ifname", "") or "").strip()
     gloo_socket_ifname = str(distributed_config.get("gloo_socket_ifname", "") or "").strip()
+    sync_config_from_main = _to_bool(distributed_config.get("sync_config_from_main"), True)
+    sync_config_keys_from_main = _parse_csv(distributed_config.get("sync_config_keys_from_main"), DEFAULT_SYNC_CONFIG_KEYS)
+    sync_missing_assets_from_main = _to_bool(distributed_config.get("sync_missing_assets_from_main"), True)
+    sync_asset_keys = _parse_csv(distributed_config.get("sync_asset_keys"), DEFAULT_SYNC_ASSET_KEYS)
+    sync_main_repo_dir = str(distributed_config.get("sync_main_repo_dir", base_dir_path()) or base_dir_path())
+    sync_main_toml = str(distributed_config.get("sync_main_toml", "") or "").strip()
+    sync_ssh_user = str(distributed_config.get("sync_ssh_user", "") or "").strip()
+    sync_ssh_port = int(distributed_config.get("sync_ssh_port", 22) or 22)
     num_processes_per_machine = distributed_config.get("num_processes")
     if num_processes_per_machine is None:
         num_processes_per_machine = len(gpu_ids) if gpu_ids else 1
@@ -55,6 +323,38 @@ def run_train(toml_path: str,
         customize_env["NCCL_SOCKET_IFNAME"] = nccl_socket_ifname
     if gloo_socket_ifname:
         customize_env["GLOO_SOCKET_IFNAME"] = gloo_socket_ifname
+
+    is_worker = num_machines > 1 and machine_rank > 0
+    if is_worker:
+        remote_host = f"{sync_ssh_user}@{main_process_ip}" if sync_ssh_user else str(main_process_ip)
+        if sync_config_from_main:
+            log.info("[sync-config] worker sync from main is enabled")
+            ok, message = _sync_config_from_main(
+                toml_path=toml_path,
+                remote_host=remote_host,
+                ssh_port=sync_ssh_port,
+                remote_repo_root=sync_main_repo_dir,
+                sync_main_toml=sync_main_toml,
+                sync_keys=sync_config_keys_from_main,
+            )
+            if not ok:
+                return APIResponse(status="error", message=f"配置同步失败: {message}")
+
+        if sync_missing_assets_from_main:
+            log.info("[sync-assets] worker missing-assets sync from main is enabled")
+            ok, message = _sync_missing_assets_from_main(
+                toml_path=toml_path,
+                remote_host=remote_host,
+                ssh_port=sync_ssh_port,
+                remote_repo_root=sync_main_repo_dir,
+                asset_keys=sync_asset_keys,
+            )
+            if not ok:
+                return APIResponse(status="error", message=f"资产同步失败: {message}")
+
+    ok, message = _enforce_distributed_output_policy(toml_path=toml_path, machine_rank=machine_rank)
+    if not ok:
+        return APIResponse(status="error", message=f"输出策略应用失败: {message}")
 
     if gpu_ids:
         customize_env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
