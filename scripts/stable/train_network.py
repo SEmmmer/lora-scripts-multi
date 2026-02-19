@@ -271,8 +271,13 @@ class NetworkTrainer:
             vae.to(accelerator.device, dtype=vae_dtype)
             vae.requires_grad_(False)
             vae.eval()
+            cache_writer = accelerator.is_local_main_process if args.cache_latents_to_disk else accelerator.is_main_process
+            logger.info(
+                f"cache_latents writer role: is_local_main_process={accelerator.is_local_main_process}, "
+                f"is_main_process={accelerator.is_main_process}, use_writer={cache_writer}"
+            )
             with torch.no_grad():
-                train_dataset_group.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, accelerator.is_main_process)
+                train_dataset_group.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, cache_writer)
             vae.to("cpu")
             clean_memory_on_device(accelerator.device)
 
